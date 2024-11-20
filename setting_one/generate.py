@@ -87,6 +87,7 @@ def parse_arguments():
     parser.add_argument("--maxlen", type=int, default=1024)
     parser.add_argument("--world_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dtype", type=str, default="float32")
 
     parser.add_argument("--num_data", type=int, default=0)
     return parser.parse_args()

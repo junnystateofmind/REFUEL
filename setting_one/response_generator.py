@@ -24,6 +24,7 @@ def parse_arguments():
     parser.add_argument("--dataset", type=str, required=True, help="Path to the dataset file or dataset type (e.g., 'allenai/soda').")
     parser.add_argument("--model", type=str, required=True, help="Model name or path.")
     parser.add_argument("--num_turns", type=int, default=5, help="Number of turns to use for context.")
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"], help="Precision for model inference.")
     return parser.parse_args()
 
 
@@ -76,22 +77,17 @@ if __name__ == "__main__":
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.world_size,
+        dtype=args.dtype,  # Use the dtype argument
     )
 
     # Set random seed
     set_seed(args.seed)
 
     # Load dataset and preprocess
-    if args.dataset == "allenai/soda":
-        # Load SODA dataset
-        with open("path_to_soda.pkl", 'rb') as handle:
-            soda_data = pickle.load(handle)
-        trajectory = preprocess_soda_to_trajectory(soda_data)
-        print("SODA dataset preprocessed into trajectory format.")
-    else:
-        # Load a generic dataset (assume preprocessed trajectory format)
-        with open(args.dataset, 'rb') as handle:
-            trajectory = pickle.load(handle)
+    with open(args.dataset, 'rb') as handle:
+        soda_data = pickle.load(handle)
+    trajectory = preprocess_soda_to_trajectory(soda_data)
+    print("Dataset preprocessed into trajectory format.")
 
     # Refine prompts
     prompts, prompt_i_to_traj_i = refine_soda_prompts(trajectory, args.num_turns)
