@@ -25,17 +25,18 @@ def parse_arguments():
     parser.add_argument("--dataset", type=str)
     parser.add_argument("--model", type=str)
     parser.add_argument("--num_turns", type=int, default=5)
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
     return parser.parse_args()
 
 
 def get_prompt(trajectory):
-    prompt = 'Below is a dialogue between the user and the assistant. Pretend you are the user in this conversation. What question would you ask next? \n\n'
+    prompt = 'Below is a dialogue between the user and the assistant. Pretend you are the user in this conversation. What question would you ask next?\n\n'
     for turn in trajectory:
-        prompt += '### ' + turn['role']
+        prompt += '### ' + turn['role'].capitalize()
         prompt += ': '
         prompt += turn['content']
         prompt += '\n\n'
-    prompt += '### Instructions: \nFIRST provide a justification of the question you want to ask. \nSECOND, on a new line, state only the question. Your response should use the format: \nJustification: \nQuestion: '
+    prompt += '### Instructions:\nFIRST provide a justification of the question you want to ask.\nSECOND, on a new line, state only the question. Your response should use the format:\nJustification:\nQuestion:'
     return [{"role": "user", "content": prompt}]
 
 if __name__ == "__main__":
@@ -47,10 +48,11 @@ if __name__ == "__main__":
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.world_size,
+        dtype=args.dtype,
     )
 
     set_seed(args.seed)
-    
+
     # construct prompts
     with open(args.dataset, 'rb') as handle:
         trajectory = pickle.load(handle)
@@ -73,7 +75,8 @@ if __name__ == "__main__":
     # merge to trajectory and save
     for r in range(len(output)):
         try:
-            trajectory[prompt_i_to_traj_i[r]].append({"role": "user", "content": output[r].rsplit('Question:', 1)[1].strip()})
+            question = output[r].rsplit('Question:', 1)[1].strip()
+            trajectory[prompt_i_to_traj_i[r]].append({"role": "user", "content": question})
         except:
             print(prompt_i_to_traj_i[r], 'added all outputs')
             trajectory[prompt_i_to_traj_i[r]].append({"role": "user", "content": output[r].strip()})
