@@ -1,3 +1,5 @@
+# response_generator.py (수정된 코드)
+
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 import argparse
@@ -16,97 +18,80 @@ def set_seed(seed=5775709):
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for generation.")
-    parser.add_argument("--maxlen", type=int, default=1024, help="Maximum length of generated tokens.")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility.")
-    parser.add_argument("--world_size", type=int, default=4, help="Tensor parallel size for the model.")
-    parser.add_argument("--dataset", type=str, required=True, help="Path to the dataset file or dataset type (e.g., 'allenai/soda').")
-    parser.add_argument("--model", type=str, required=True, help="Model name or path.")
-    parser.add_argument("--num_turns", type=int, default=5, help="Number of turns to use for context.")
-    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"], help="Precision for model inference.")
+    parser = argparse.ArgumentParser(description="Response Generator for REFUEL")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    parser.add_argument("--maxlen", type=int, default=1024, help="Maximum length of generated tokens")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--world_size", type=int, default=4, help="Number of parallel processes")
+    parser.add_argument("--dataset", type=str, required=True, help="Path to the dataset pickle file")
+    parser.add_argument("--model", type=str, required=True, help="Model name or path")
+    parser.add_argument("--num_turns", type=int, default=5, help="Number of turns to generate")
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"], help="Data type for model")
     return parser.parse_args()
 
 
-def preprocess_soda_to_trajectory(soda_data):
-    """
-    Convert SODA dataset to trajectory format.
-    Args:
-        soda_data (list): List of dialogue entries from SODA dataset.
-    Returns:
-        trajectory (list): List of trajectories, each containing user and assistant turns.
-    """
-    trajectory = []
-    for item in soda_data:
-        turns = item['trajectory']
-        formatted_turns = []
-        for turn in turns:
-            formatted_turns.append({"role": turn['from'], "content": turn['value']})
-        trajectory.append(formatted_turns)
-    return trajectory
-
-
-def refine_soda_prompts(trajectory, num_turns):
-    """
-    Refine SODA trajectories to create prompts for model generation.
-    Args:
-        trajectory (list): List of processed trajectories.
-        num_turns (int): Number of context turns to use.
-    Returns:
-        prompts (list): List of refined prompts for generation.
-        prompt_i_to_traj_i (dict): Mapping of prompt indices to trajectory indices.
-    """
-    prompts, prompt_i_to_traj_i = [], {}
-    for i, t in enumerate(trajectory):
-        if len(t) < num_turns * 2:  # Ensure enough turns exist
-            dialogue_history = " ".join(
-                [turn["content"] for turn in t if turn["role"] == "user"]
-            )
-            assistant_turns = [turn["content"] for turn in t if turn["role"] == "assistant"]
-            prompts.append(f"{dialogue_history} {assistant_turns[-1] if assistant_turns else ''}")
-            prompt_i_to_traj_i[len(prompts) - 1] = i
-    return prompts, prompt_i_to_traj_i
+def get_prompt(trajectory, narrative):
+    prompt = f'### Narrative:\n{narrative}\n\n'
+    prompt += 'Below is a dialogue among multiple speakers. Pretend you are the assistant in this conversation. What would you respond next?\n\n'
+    for turn in trajectory:
+        prompt += '### ' + turn['role'].capitalize()
+        prompt += ': '
+        prompt += turn['content']
+        prompt += '\n\n'
+    prompt += '### Instructions:\nFIRST provide a justification of your response.\nSECOND, on a new line, state only the response. Your response should use the format:\nJustification:\nResponse:'
+    return [{"role": "assistant", "content": prompt}]
 
 
 if __name__ == "__main__":
 
-    # Initialize arguments and model
+    # Initialize arguments and components
     args = parse_arguments()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.world_size,
-        dtype=args.dtype,  # Use the dtype argument
+        dtype=args.dtype,
     )
 
-    # Set random seed
     set_seed(args.seed)
 
-    # Load dataset and preprocess
+    # Load dataset
     with open(args.dataset, 'rb') as handle:
-        soda_data = pickle.load(handle)
-    trajectory = preprocess_soda_to_trajectory(soda_data)
-    print("Dataset preprocessed into trajectory format.")
+        combined_data = pickle.load(handle)
 
-    # Refine prompts
-    prompts, prompt_i_to_traj_i = refine_soda_prompts(trajectory, args.num_turns)
+    prompts, prompt_i_to_traj_i = [], {}
+    for i, entry in enumerate(combined_data):
+        trajectory = entry['trajectory']
+        narrative = entry['narrative']
+        if len(trajectory) < args.num_turns * 2:
+            prompts.append(get_prompt(trajectory, narrative))
+            prompt_i_to_traj_i[len(prompts) - 1] = i
+
+    # Apply chat template (assuming apply_chat_template is correctly defined)
+    prompts = [tokenizer.apply_chat_template(t, tokenize=False, add_generation_prompt=True) for t in prompts]
 
     # Generate responses
     sampling_params = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.maxlen,
-        seed=args.seed,
+        seed=args.seed
     )
     response = llm.generate(prompts, sampling_params)
-    output = list(map(lambda x: x.outputs[0].text, response))
+    output = [x.outputs[0].text for x in response]
 
     # Merge generated responses into trajectory
     for r in range(len(output)):
-        trajectory[prompt_i_to_traj_i[r]].append({"role": "assistant", "content": output[r]})
+        try:
+            # Extract the generated response after 'Response:'
+            response_text = output[r].rsplit('Response:', 1)[1].strip()
+            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "assistant", "content": response_text})
+        except IndexError:
+            # If 'Response:' is not found, append the entire output
+            print(prompt_i_to_traj_i[r], 'added all outputs')
+            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "assistant", "content": output[r].strip()})
 
-    # Save updated trajectory back to file
-    save_path = args.dataset if args.dataset != "allenai/soda" else "updated_soda.pkl"
-    with open(save_path, 'wb') as handle:
-        pickle.dump(trajectory, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"Responses saved to {save_path}")
+    # Save the updated dataset
+    with open(args.dataset, 'wb') as handle:
+        pickle.dump(combined_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f'Responses generated and saved to {args.dataset}')

@@ -1,3 +1,4 @@
+# generate.py (수정된 코드)
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 import argparse
@@ -19,10 +20,9 @@ def change_format(row):
     new_trajectory = []
     for speaker, utterance in zip(row["speakers"], row["dialogue"]):
         role = speaker  # 발화자 이름을 그대로 사용
-        new_trajectory.append({'from': role, 'value': utterance})
+        new_trajectory.append({'role': role, 'content': utterance})
     row["trajectory"] = new_trajectory
     return row
-
 
 
 # 중복 제거 함수 (필요에 따라 수정 가능)
@@ -49,7 +49,7 @@ def call_scripts(args, seed, gen_type):
                             '--seed', f'{seed}', \
                             '--num_turns', f'{args.num_turns}', \
                             '--dtype', f'{args.dtype}'], check=True)
-        except:
+        except subprocess.CalledProcessError:
             return False
     else:
         try:
@@ -62,7 +62,7 @@ def call_scripts(args, seed, gen_type):
                             '--seed', f'{seed}', \
                             '--num_turns', f'{args.num_turns}', \
                             '--dtype', f'{args.dtype}'], check=True)
-        except:
+        except subprocess.CalledProcessError:
             return False
 
     return True
@@ -77,8 +77,8 @@ def call_scripts_wrapper(args, seed, gen_type):
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--user_model", type=str, default="meta-llama/Meta-Llama-3.1-70B-Instruct")
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.2-1B")
+    parser.add_argument("--user_model", type=str, default="meta-llama/Meta-Llama-3.2-1B")
 
     parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--output_repo", type=str, default="")
@@ -112,13 +112,17 @@ if __name__ == "__main__":
     dataset = dataset.map(change_format)
     dataset = dataset.filter(lambda row: check_redundant(tokenizer, row))
 
-    # save prompt from the initial turn
-    trajectory = []
+    # save prompt and narrative from the initial turn
+    combined_data = []
     for i in range(len(dataset)):
-        trajectory.append([dataset[i]['trajectory'][0]])
+        combined_entry = {
+            'narrative': dataset[i].get('narrative', ''),
+            'trajectory': [dataset[i]['trajectory'][0]]
+        }
+        combined_data.append(combined_entry)
     with open(os.path.join(args.output_dir, 'temp.pkl'), 'wb') as handle:
-        pickle.dump(trajectory, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f'initial prompt saved to {os.path.join(args.output_dir, "temp.pkl")}')
+        pickle.dump(combined_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f'initial prompt and narrative saved to {os.path.join(args.output_dir, "temp.pkl")}')
 
     # generate for num_turns
     for i in range(args.num_turns):
@@ -126,10 +130,10 @@ if __name__ == "__main__":
 
         # load saved trajectories
         with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
-            trajectory = pickle.load(handle)
+            combined_data = pickle.load(handle)
 
         # save checkpoint
-        temp_dataset = Dataset.from_dict({"trajectory": trajectory})
+        temp_dataset = Dataset.from_dict({"data": combined_data})
         temp_dataset.push_to_hub(args.output_repo + f'_{args.num_turns}_turns_only_ckp_{i}')
 
         if i < args.num_turns - 1:
@@ -137,6 +141,6 @@ if __name__ == "__main__":
 
     # load saved trajectories
     with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
-        trajectory = pickle.load(handle)
-    generated = Dataset.from_dict({"trajectory": trajectory})
+        combined_data = pickle.load(handle)
+    generated = Dataset.from_dict({"data": combined_data})
     generated.push_to_hub(args.output_repo + f'_{args.num_turns}_turns_only')
