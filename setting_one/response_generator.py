@@ -1,8 +1,9 @@
-# response_generator.py (수정된 코드)
+# user_generator.py (수정된 코드)
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 import argparse
+import os
 import pickle
 import random
 import numpy as np
@@ -18,8 +19,8 @@ def set_seed(seed=5775709):
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Response Generator for REFUEL")
-    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    parser = argparse.ArgumentParser(description="User Generator for REFUEL")
+    parser.add_argument("--temperature", type=float, default=0.01, help="Sampling temperature")
     parser.add_argument("--maxlen", type=int, default=1024, help="Maximum length of generated tokens")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--world_size", type=int, default=4, help="Number of parallel processes")
@@ -32,14 +33,14 @@ def parse_arguments():
 
 def get_prompt(trajectory, narrative):
     prompt = f'### Narrative:\n{narrative}\n\n'
-    prompt += 'Below is a dialogue among multiple speakers. Pretend you are the assistant in this conversation. What would you respond next?\n\n'
+    prompt += 'Below is a dialogue among multiple speakers. Pretend you are the user in this conversation. What question would you ask next?\n\n'
     for turn in trajectory:
         prompt += '### ' + turn['role'].capitalize()
         prompt += ': '
         prompt += turn['content']
         prompt += '\n\n'
-    prompt += '### Instructions:\nFIRST provide a justification of your response.\nSECOND, on a new line, state only the response. Your response should use the format:\nJustification:\nResponse:'
-    return [{"role": "assistant", "content": prompt}]
+    prompt += '### Instructions:\nFIRST provide a justification of the question you want to ask.\nSECOND, on a new line, state only the question. Your response should use the format:\nJustification:\nQuestion:'
+    return {"role": "user", "content": prompt}
 
 
 if __name__ == "__main__":
@@ -68,8 +69,8 @@ if __name__ == "__main__":
             prompts.append(get_prompt(trajectory, narrative))
             prompt_i_to_traj_i[len(prompts) - 1] = i
 
-    # Apply chat template (assuming apply_chat_template is correctly defined)
-    prompts = [tokenizer.apply_chat_template(t, tokenize=False, add_generation_prompt=True) for t in prompts]
+    # Remove apply_chat_template and use direct prompt
+    prompts = [t["content"] for t in prompts]
 
     # Generate responses
     sampling_params = SamplingParams(
@@ -80,18 +81,18 @@ if __name__ == "__main__":
     response = llm.generate(prompts, sampling_params)
     output = [x.outputs[0].text for x in response]
 
-    # Merge generated responses into trajectory
+    # Merge generated questions into trajectory
     for r in range(len(output)):
         try:
-            # Extract the generated response after 'Response:'
-            response_text = output[r].rsplit('Response:', 1)[1].strip()
-            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "assistant", "content": response_text})
+            # Extract the generated question after 'Question:'
+            question = output[r].rsplit('Question:', 1)[1].strip()
+            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "user", "content": question})
         except IndexError:
-            # If 'Response:' is not found, append the entire output
+            # If 'Question:' is not found, append the entire output
             print(prompt_i_to_traj_i[r], 'added all outputs')
-            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "assistant", "content": output[r].strip()})
+            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "user", "content": output[r].strip()})
 
     # Save the updated dataset
     with open(args.dataset, 'wb') as handle:
         pickle.dump(combined_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f'Responses generated and saved to {args.dataset}')
+    print(f'Questions generated and saved to {args.dataset}')

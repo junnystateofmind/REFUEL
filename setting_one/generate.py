@@ -9,11 +9,9 @@ import time
 import subprocess
 import numpy as np
 
-
 def set_seed(seed=5775709):
     random.seed(seed)
     np.random.seed(seed)
-
 
 # SODA 데이터셋에 맞게 형식 변경
 def change_format(row):
@@ -24,8 +22,17 @@ def change_format(row):
     row["trajectory"] = new_trajectory
     return row
 
-
 # 중복 제거 함수 (필요에 따라 수정 가능)
+unique_traj = {}
+def check_redundant(tokenizer, row):
+    trajectory = row["trajectory"]
+    # 각 턴을 "role:content" 형식으로 변환하여 튜플로 만듭니다.
+    tokenized = tuple([f"{turn['role']}:{turn['content']}" for turn in trajectory])
+    if tokenized in unique_traj:
+        return False
+    unique_traj[tokenized] = 1
+    return True
+# filter redundant
 unique_traj = {}
 def check_redundant(tokenizer, row):
     tokenized = tokenizer.apply_chat_template(row["trajectory"], add_generation_prompt=False, tokenize=True)
@@ -47,9 +54,8 @@ def call_scripts(args, seed, gen_type):
                             '--world_size', f'{args.world_size}', \
                             '--model', f'{args.model}', \
                             '--seed', f'{seed}', \
-                            '--num_turns', f'{args.num_turns}', \
-                            '--dtype', f'{args.dtype}'], check=True)
-        except subprocess.CalledProcessError:
+                            '--num_turns', f'{args.num_turns}'], check=True)
+        except:
             return False
     else:
         try:
@@ -60,11 +66,10 @@ def call_scripts(args, seed, gen_type):
                             '--world_size', f'{args.world_size}', \
                             '--model', f'{args.user_model}', \
                             '--seed', f'{seed}', \
-                            '--num_turns', f'{args.num_turns}', \
-                            '--dtype', f'{args.dtype}'], check=True)
-        except subprocess.CalledProcessError:
+                            '--num_turns', f'{args.num_turns}'], check=True)
+        except:
             return False
-
+    
     return True
 
 
@@ -77,13 +82,13 @@ def call_scripts_wrapper(args, seed, gen_type):
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.2-1B")
-    parser.add_argument("--user_model", type=str, default="meta-llama/Meta-Llama-3.2-1B")
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--user_model", type=str, default="meta-llama/Meta-Llama-3.1-70B-Instruct")
 
     parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--output_repo", type=str, default="")
 
-    parser.add_argument("--dataset", type=str, default="allenai/soda")
+    parser.add_argument("--dataset", type=str, default="openbmb/UltraInteract_pair")
     parser.add_argument("--dataset_split", type=str, default="train")
 
     parser.add_argument("--num_turns", type=int, default=5)
@@ -91,7 +96,6 @@ def parse_arguments():
     parser.add_argument("--maxlen", type=int, default=1024)
     parser.add_argument("--world_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "float16", "bfloat16"])
 
     parser.add_argument("--num_data", type=int, default=0)
     return parser.parse_args()
@@ -112,17 +116,13 @@ if __name__ == "__main__":
     dataset = dataset.map(change_format)
     dataset = dataset.filter(lambda row: check_redundant(tokenizer, row))
 
-    # save prompt and narrative from the initial turn
-    combined_data = []
+    # save prompt from the initial turn
+    trajectory = []
     for i in range(len(dataset)):
-        combined_entry = {
-            'narrative': dataset[i].get('narrative', ''),
-            'trajectory': [dataset[i]['trajectory'][0]]
-        }
-        combined_data.append(combined_entry)
+        trajectory.append([dataset[i]['trajectory'][0]])
     with open(os.path.join(args.output_dir, 'temp.pkl'), 'wb') as handle:
-        pickle.dump(combined_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f'initial prompt and narrative saved to {os.path.join(args.output_dir, "temp.pkl")}')
+        pickle.dump(trajectory, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f'initial prompt saved to {os.path.join(args.output_dir, "temp.pkl")}')
 
     # generate for num_turns
     for i in range(args.num_turns):
@@ -130,17 +130,60 @@ if __name__ == "__main__":
 
         # load saved trajectories
         with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
-            combined_data = pickle.load(handle)
+            trajectory = pickle.load(handle)
 
         # save checkpoint
-        temp_dataset = Dataset.from_dict({"data": combined_data})
+        temp_dataset = Dataset.from_dict({"trajectory": trajectory})
         temp_dataset.push_to_hub(args.output_repo + f'_{args.num_turns}_turns_only_ckp_{i}')
-
+        
         if i < args.num_turns - 1:
-            call_scripts_wrapper(args, args.seed, gen_type='user')
+            call_scripts_wrapper(args, args.seed, gen_type='user')  
 
     # load saved trajectories
     with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
-        combined_data = pickle.load(handle)
-    generated = Dataset.from_dict({"data": combined_data})
+        trajectory = pickle.load(handle)
+    generated = Dataset.from_dict({"trajectory": trajectory})
     generated.push_to_hub(args.output_repo + f'_{args.num_turns}_turns_only')
+
+    # ==========================================================================
+
+    # randomly sample an h from num_turns
+    sampled_len = np.random.choice(args.num_turns, size=len(generated))
+    sampled_h = np.random.randint(0, sampled_len + 1)
+    generated = generated.add_column(f"sampled_len_from_{args.num_turns}", sampled_len)
+    generated = generated.add_column(f"sampled_h_from_sampled_len", sampled_h)
+
+    # save prompt from the sampled turn
+    trajectory = []
+    for i in range(len(generated)):
+        trajectory.append(generated[i]['trajectory'][:sampled_h[i]*2+1])
+    with open(os.path.join(args.output_dir, 'temp.pkl'), 'wb') as handle:
+        pickle.dump(trajectory, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f'sampled prompt saved to {os.path.join(args.output_dir, "temp.pkl")}')
+
+    # generate for num_turns
+    for i in range(args.num_turns):
+        call_scripts_wrapper(args, args.seed + 20000, gen_type='response')
+
+        # load saved trajectories
+        with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
+            trajectory = pickle.load(handle)
+
+        # save checkpoint
+        temp_dataset = Dataset.from_dict({f"trajectory_sampled_h_from_sampled_len": trajectory})
+        temp_dataset = temp_dataset.add_column(f"sampled_len_from_{args.num_turns}", sampled_len)
+        temp_dataset = temp_dataset.add_column(f"sampled_h_from_sampled_len", sampled_h)
+        temp_dataset.push_to_hub(args.output_repo + f'_sampled_h_from_sampled_len_ckp_{i}')
+
+        if i < args.num_turns - 1:
+            call_scripts_wrapper(args, args.seed + 20000, gen_type='user')
+
+    # load saved trajectories
+    with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
+        trajectory = pickle.load(handle)
+
+    # save checkpoint
+    generated = generated.add_column(f"trajectory_sampled_h_from_sampled_len", trajectory)
+    generated.push_to_hub(args.output_repo)
+
+    os.remove(os.path.join(args.output_dir, 'temp.pkl'))

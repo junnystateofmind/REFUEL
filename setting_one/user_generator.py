@@ -40,7 +40,7 @@ def get_prompt(trajectory, narrative):
         prompt += turn['content']
         prompt += '\n\n'
     prompt += '### Instructions:\nFIRST provide a justification of the question you want to ask.\nSECOND, on a new line, state only the question. Your response should use the format:\nJustification:\nQuestion:'
-    return [{"role": "user", "content": prompt}]
+    return {"role": "user", "content": prompt}
 
 
 if __name__ == "__main__":
@@ -69,8 +69,8 @@ if __name__ == "__main__":
             prompts.append(get_prompt(trajectory, narrative))
             prompt_i_to_traj_i[len(prompts) - 1] = i
 
-    # Apply chat template (assuming apply_chat_template is correctly defined)
-    prompts = [tokenizer.apply_chat_template(t, tokenize=False, add_generation_prompt=True) for t in prompts]
+    # Remove apply_chat_template and use direct prompt
+    prompts = [t["content"] for t in prompts]
 
     # Generate responses
     sampling_params = SamplingParams(
