@@ -1,5 +1,3 @@
-# user_generator.py (수정된 코드)
-
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 import argparse
@@ -11,88 +9,106 @@ import torch
 
 
 def set_seed(seed=5775709):
+    """Set random seed for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
+def apply_chat_template(trajectory, narrative, add_generation_prompt=False):
+    prompt = f"### Narrative:\n{narrative}\n\n"
+    for turn in trajectory:
+        role = turn.get('role', 'user')  # Default role is 'user'
+        content = turn.get('content', '')
+        # 명확한 역할 구분을 위해 Role 추가
+        prompt += f"{role.capitalize()}:\n{content}\n\n"
+    if add_generation_prompt:
+        prompt += "User:\n"  # 항상 user의 역할을 유도
+    return prompt
+
+
+
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="User Generator for REFUEL")
-    parser.add_argument("--temperature", type=float, default=0.01, help="Sampling temperature")
-    parser.add_argument("--maxlen", type=int, default=1024, help="Maximum length of generated tokens")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--world_size", type=int, default=4, help="Number of parallel processes")
-    parser.add_argument("--dataset", type=str, required=True, help="Path to the dataset pickle file")
-    parser.add_argument("--model", type=str, required=True, help="Model name or path")
-    parser.add_argument("--num_turns", type=int, default=5, help="Number of turns to generate")
-    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"], help="Data type for model")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for LLM")
+    parser.add_argument("--maxlen", type=int, default=1024, help="Maximum token length for generation")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
+    parser.add_argument("--world_size", type=int, default=4, help="Number of GPUs for model parallelism")
+    parser.add_argument("--dataset", type=str, required=True, help="Path to dataset (Pickle file)")
+    parser.add_argument("--model", type=str, required=True, help="Pretrained model name or path")
+    parser.add_argument("--num_turns", type=int, default=5, help="Number of conversation turns to include in the prompt")
+    parser.add_argument("--dtype", type=str, default="float32", help="Data type for the LLM")
     return parser.parse_args()
 
 
-def get_prompt(trajectory, narrative):
-    prompt = f'### Narrative:\n{narrative}\n\n'
-    prompt += 'Below is a dialogue among multiple speakers. Pretend you are the user in this conversation. What question would you ask next?\n\n'
-    for turn in trajectory:
-        prompt += '### ' + turn['role'].capitalize()
-        prompt += ': '
-        prompt += turn['content']
-        prompt += '\n\n'
-    prompt += '### Instructions:\nFIRST provide a justification of the question you want to ask.\nSECOND, on a new line, state only the question. Your response should use the format:\nJustification:\nQuestion:'
-    return {"role": "user", "content": prompt}
-
-
 if __name__ == "__main__":
-
-    # Initialize arguments and components
+    # Parse arguments and set random seed
     args = parse_arguments()
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    llm = LLM(
-        model=args.model,
-        tensor_parallel_size=args.world_size,
-        dtype=args.dtype,
-    )
-
     set_seed(args.seed)
 
+    # Initialize tokenizer and model
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        llm = LLM(
+            model=args.model,
+            tensor_parallel_size=args.world_size,
+            dtype=args.dtype,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize model or tokenizer: {e}")
+
     # Load dataset
-    with open(args.dataset, 'rb') as handle:
-        combined_data = pickle.load(handle)
+    try:
+        with open(args.dataset, 'rb') as handle:
+            combined_data = pickle.load(handle)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load dataset: {e}")
 
-    prompts, prompt_i_to_traj_i = [], {}
+    # Validate dataset format
+    if not all(isinstance(entry, dict) for entry in combined_data):
+        # check combined_data's type
+        print("combined_data's type: ", type(combined_data))
+        print("entry's type: ", type(combined_data[0]))
+        raise ValueError("Dataset must be a list of dictionaries.")
+
+    # Prepare prompts
+    prompts = []
+    prompt_idx_to_data_idx = {}
     for i, entry in enumerate(combined_data):
-        trajectory = entry['trajectory']
-        narrative = entry['narrative']
-        if len(trajectory) < args.num_turns * 2:
-            prompts.append(get_prompt(trajectory, narrative))
-            prompt_i_to_traj_i[len(prompts) - 1] = i
-
-    # Remove apply_chat_template and use direct prompt
-    prompts = [t["content"] for t in prompts]
+        trajectory = entry.get('trajectory', [])
+        narrative = entry.get('narrative', "Default narrative")
+        if len(trajectory) >= args.num_turns * 2:
+            continue
+        prompt = apply_chat_template(trajectory, narrative, add_generation_prompt=True)
+        prompts.append(prompt)
+        prompt_idx_to_data_idx[len(prompts) - 1] = i
 
     # Generate responses
     sampling_params = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.maxlen,
-        seed=args.seed
+        seed=args.seed,
     )
-    response = llm.generate(prompts, sampling_params)
-    output = [x.outputs[0].text for x in response]
+    try:
+        responses = llm.generate(prompts, sampling_params)
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate responses: {e}")
 
-    # Merge generated questions into trajectory
-    for r in range(len(output)):
-        try:
-            # Extract the generated question after 'Question:'
-            question = output[r].rsplit('Question:', 1)[1].strip()
-            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "user", "content": question})
-        except IndexError:
-            # If 'Question:' is not found, append the entire output
-            print(prompt_i_to_traj_i[r], 'added all outputs')
-            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "user", "content": output[r].strip()})
+    # Update dataset with generated responses
+    outputs = [resp.outputs[0].text.strip() for resp in responses]
+for idx, output in enumerate(outputs):
+    data_idx = prompt_idx_to_data_idx[idx]
+    # role을 명시적으로 'assistant'로 고정
+    combined_data[data_idx]['trajectory'].append({"role": "assistant", "content": output})
 
-    # Save the updated dataset
-    with open(args.dataset, 'wb') as handle:
-        pickle.dump(combined_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f'Questions generated and saved to {args.dataset}')
+
+    # Save updated dataset
+    try:
+        with open(args.dataset, 'wb') as handle:
+            pickle.dump(combined_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Responses successfully generated and saved to {args.dataset}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to save dataset: {e}")

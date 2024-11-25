@@ -1,4 +1,3 @@
-# generate.py (수정된 코드)
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 import argparse
@@ -9,6 +8,7 @@ import time
 import subprocess
 import numpy as np
 
+
 def set_seed(seed=5775709):
     random.seed(seed)
     np.random.seed(seed)
@@ -16,35 +16,58 @@ def set_seed(seed=5775709):
 # SODA 데이터셋에 맞게 형식 변경
 def change_format(row):
     new_trajectory = []
-    for speaker, utterance in zip(row["speakers"], row["dialogue"]):
-        role = speaker  # 발화자 이름을 그대로 사용
+    if "narrative" in row and row["narrative"]:  # narrative 추가
+        new_trajectory.append({
+            "role": "system",
+            "content": row["narrative"]
+        })
+    for i, (speaker, utterance) in enumerate(zip(row["speakers"], row["dialogue"])):
+        role = "user" if i % 2 == 0 else "assistant"  # 역할을 user/assistant로 고정
         new_trajectory.append({'role': role, 'content': utterance})
     row["trajectory"] = new_trajectory
     return row
 
-# 중복 제거 함수 (필요에 따라 수정 가능)
-unique_traj = {}
-def check_redundant(tokenizer, row):
-    trajectory = row["trajectory"]
-    # 각 턴을 "role:content" 형식으로 변환하여 튜플로 만듭니다.
-    tokenized = tuple([f"{turn['role']}:{turn['content']}" for turn in trajectory])
-    if tokenized in unique_traj:
-        return False
-    unique_traj[tokenized] = 1
-    return True
-# filter redundant
-unique_traj = {}
-def check_redundant(tokenizer, row):
-    tokenized = tokenizer.apply_chat_template(row["trajectory"], add_generation_prompt=False, tokenize=True)
-    tokenized = tuple(tokenized)
-    if tokenized in unique_traj:
-        return False
-    unique_traj[tokenized] = 1
-    return True
+def restructure_data_for_generator(data):
+    """
+    SODA 데이터셋의 list 또는 Dataset 객체를 list[dict] 형태로 변환.
+    """
+    structured_data = []
+    for entry in data:
+        # 각 entry가 dict인지 확인
+        if isinstance(entry, dict) and "trajectory" in entry:
+            # 이미 `trajectory` 필드가 있다면 그대로 추가
+            structured_data.append({
+                "trajectory": entry["trajectory"],
+                "narrative": entry.get("narrative", "Default narrative")  # narrative 추가
+            })
+        else:
+            print("[DEBUG] Unexpected entry format:", entry)
+    
+    # 변환된 데이터 디버깅 출력
+    if structured_data:
+        print("[DEBUG] First entry in structured_data:", structured_data[0])
+    else:
+        print("[DEBUG] No valid entries found in dataset.")
+    
+    return structured_data
 
+
+# 중복 제거 함수
+unique_traj = {}
+def check_redundant(tokenizer, row):
+    try:
+        dialogue_text = " ".join([f"{msg['role']}: {msg['content']}" for msg in row["trajectory"]])
+        tokenized = tokenizer(dialogue_text, truncation=True, padding=True, return_tensors="pt").input_ids.tolist()
+        tokenized = tuple(tokenized[0])
+        if tokenized in unique_traj:
+            return False
+        unique_traj[tokenized] = 1
+        return True
+    except Exception as e:
+        print("[DEBUG] Error in check_redundant with row:", row)
+        raise e
 
 def call_scripts(args, seed, gen_type):
-
     if gen_type == 'response':
         try:
             subprocess.run(['python', './setting_one/response_generator.py', \
@@ -54,7 +77,8 @@ def call_scripts(args, seed, gen_type):
                             '--world_size', f'{args.world_size}', \
                             '--model', f'{args.model}', \
                             '--seed', f'{seed}', \
-                            '--num_turns', f'{args.num_turns}'], check=True)
+                            '--num_turns', f'{args.num_turns}', \
+                            '--dtype', f'{args.dtype}'], check=True)
         except:
             return False
     else:
@@ -66,18 +90,16 @@ def call_scripts(args, seed, gen_type):
                             '--world_size', f'{args.world_size}', \
                             '--model', f'{args.user_model}', \
                             '--seed', f'{seed}', \
-                            '--num_turns', f'{args.num_turns}'], check=True)
+                            '--num_turns', f'{args.num_turns}', \
+                            '--dtype', f'{args.dtype}'], check=True)
         except:
             return False
-    
     return True
-
 
 def call_scripts_wrapper(args, seed, gen_type):
     while not call_scripts(args, seed, gen_type):
         time.sleep(20)
         print(f'error when generating {gen_type}')
-
 
 def parse_arguments():
     """Parse command line arguments."""
@@ -88,7 +110,7 @@ def parse_arguments():
     parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--output_repo", type=str, default="")
 
-    parser.add_argument("--dataset", type=str, default="openbmb/UltraInteract_pair")
+    parser.add_argument("--dataset", type=str, default="allenai/soda")
     parser.add_argument("--dataset_split", type=str, default="train")
 
     parser.add_argument("--num_turns", type=int, default=5)
@@ -96,94 +118,64 @@ def parse_arguments():
     parser.add_argument("--maxlen", type=int, default=1024)
     parser.add_argument("--world_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "float16", "bfloat16"])
 
     parser.add_argument("--num_data", type=int, default=0)
     return parser.parse_args()
 
-
 if __name__ == "__main__":
 
-    # init
+    # 초기화
     args = parse_arguments()
     set_seed(args.seed)
     dataset = load_dataset(args.dataset, split=args.dataset_split)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
-    # preprocess
+    # 전처리
     if args.num_data != 0:
         dataset = dataset.select(range(args.num_data))
     dataset = dataset.map(change_format)
-    dataset = dataset.filter(lambda row: check_redundant(tokenizer, row))
 
-    # save prompt from the initial turn
+    # list[list] 구조를 list[dict] 구조로 변환
+    dataset = restructure_data_for_generator(dataset)
+
+    # 중복 제거
+    dataset = [row for row in dataset if check_redundant(tokenizer, row)]
+
+    # 초기 프롬프트 저장
     trajectory = []
-    for i in range(len(dataset)):
-        trajectory.append([dataset[i]['trajectory'][0]])
+    for entry in dataset:
+        if entry['trajectory']:
+            trajectory.append({
+                "trajectory": [entry['trajectory'][0]],  # 첫 발화만 저장
+                "narrative": entry.get("narrative", "Default narrative")  # narrative 추가
+            })
     with open(os.path.join(args.output_dir, 'temp.pkl'), 'wb') as handle:
         pickle.dump(trajectory, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f'initial prompt saved to {os.path.join(args.output_dir, "temp.pkl")}')
+    print(f'Initial prompt saved to {os.path.join(args.output_dir, "temp.pkl")}')
 
-    # generate for num_turns
-    for i in range(args.num_turns):
+    # 생성 루프
+    # 생성 루프에서 중간 저장 시 trajectory만 업로드
+    for turn in range(args.num_turns):
         call_scripts_wrapper(args, args.seed, gen_type='response')
-
-        # load saved trajectories
+    
+        # 중간 결과 저장
         with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
             trajectory = pickle.load(handle)
-
-        # save checkpoint
-        temp_dataset = Dataset.from_dict({"trajectory": trajectory})
-        temp_dataset.push_to_hub(args.output_repo + f'_{args.num_turns}_turns_only_ckp_{i}')
         
-        if i < args.num_turns - 1:
-            call_scripts_wrapper(args, args.seed, gen_type='user')  
-
-    # load saved trajectories
+        # trajectory 데이터만 필터링
+        temp_dataset = Dataset.from_dict({"trajectory": [entry['trajectory'] for entry in trajectory]})
+        temp_dataset.push_to_hub(args.output_repo + f'_{args.num_turns}_turns_ckp_{turn}')
+    
+        if turn < args.num_turns - 1:
+            call_scripts_wrapper(args, args.seed, gen_type='user')
+    
+    # 최종 저장 시 trajectory만 업로드
     with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
         trajectory = pickle.load(handle)
-    generated = Dataset.from_dict({"trajectory": trajectory})
-    generated.push_to_hub(args.output_repo + f'_{args.num_turns}_turns_only')
-
-    # ==========================================================================
-
-    # randomly sample an h from num_turns
-    sampled_len = np.random.choice(args.num_turns, size=len(generated))
-    sampled_h = np.random.randint(0, sampled_len + 1)
-    generated = generated.add_column(f"sampled_len_from_{args.num_turns}", sampled_len)
-    generated = generated.add_column(f"sampled_h_from_sampled_len", sampled_h)
-
-    # save prompt from the sampled turn
-    trajectory = []
-    for i in range(len(generated)):
-        trajectory.append(generated[i]['trajectory'][:sampled_h[i]*2+1])
-    with open(os.path.join(args.output_dir, 'temp.pkl'), 'wb') as handle:
-        pickle.dump(trajectory, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f'sampled prompt saved to {os.path.join(args.output_dir, "temp.pkl")}')
-
-    # generate for num_turns
-    for i in range(args.num_turns):
-        call_scripts_wrapper(args, args.seed + 20000, gen_type='response')
-
-        # load saved trajectories
-        with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
-            trajectory = pickle.load(handle)
-
-        # save checkpoint
-        temp_dataset = Dataset.from_dict({f"trajectory_sampled_h_from_sampled_len": trajectory})
-        temp_dataset = temp_dataset.add_column(f"sampled_len_from_{args.num_turns}", sampled_len)
-        temp_dataset = temp_dataset.add_column(f"sampled_h_from_sampled_len", sampled_h)
-        temp_dataset.push_to_hub(args.output_repo + f'_sampled_h_from_sampled_len_ckp_{i}')
-
-        if i < args.num_turns - 1:
-            call_scripts_wrapper(args, args.seed + 20000, gen_type='user')
-
-    # load saved trajectories
-    with open(os.path.join(args.output_dir, 'temp.pkl'), 'rb') as handle:
-        trajectory = pickle.load(handle)
-
-    # save checkpoint
-    generated = generated.add_column(f"trajectory_sampled_h_from_sampled_len", trajectory)
+    
+    # trajectory 데이터만 필터링
+    generated = Dataset.from_dict({"trajectory": [entry['trajectory'] for entry in trajectory]})
     generated.push_to_hub(args.output_repo)
 
-    os.remove(os.path.join(args.output_dir, 'temp.pkl'))

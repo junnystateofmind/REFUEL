@@ -1,5 +1,3 @@
-# user_generator.py (수정된 코드)
-
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 import argparse
@@ -19,7 +17,7 @@ def set_seed(seed=5775709):
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="User Generator for REFUEL")
+    parser = argparse.ArgumentParser(description="User Generator")
     parser.add_argument("--temperature", type=float, default=0.01, help="Sampling temperature")
     parser.add_argument("--maxlen", type=int, default=1024, help="Maximum length of generated tokens")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
@@ -33,20 +31,20 @@ def parse_arguments():
 
 def get_prompt(trajectory, narrative):
     prompt = f'### Narrative:\n{narrative}\n\n'
-    prompt += 'Below is a dialogue among multiple speakers. Pretend you are the user in this conversation. What question would you ask next?\n\n'
+    prompt += 'Below is a dialogue among multiple speakers. Pretend you are the user in this conversation. What would you say next?\n\n'
     for turn in trajectory:
-        prompt += '### ' + turn['role'].capitalize()
-        prompt += ': '
-        prompt += turn['content']
-        prompt += '\n\n'
-    prompt += '### Instructions:\nFIRST provide a justification of the question you want to ask.\nSECOND, on a new line, state only the question. Your response should use the format:\nJustification:\nQuestion:'
-    return {"role": "user", "content": prompt}
+        role = turn['role']  # 'user' 또는 'assistant'
+        content = turn['content']
+        prompt += f"{role.capitalize()}:\n{content}\n\n"
+    prompt += 'Assistant:\n'  # 다음 응답은 항상 user로 가정
+    return prompt
+
 
 
 if __name__ == "__main__":
-
     # Initialize arguments and components
     args = parse_arguments()
+    set_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     llm = LLM(
@@ -55,22 +53,19 @@ if __name__ == "__main__":
         dtype=args.dtype,
     )
 
-    set_seed(args.seed)
-
     # Load dataset
     with open(args.dataset, 'rb') as handle:
         combined_data = pickle.load(handle)
 
-    prompts, prompt_i_to_traj_i = [], {}
+    prompts = []
+    prompt_i_to_data_i = {}
     for i, entry in enumerate(combined_data):
         trajectory = entry['trajectory']
         narrative = entry['narrative']
         if len(trajectory) < args.num_turns * 2:
-            prompts.append(get_prompt(trajectory, narrative))
-            prompt_i_to_traj_i[len(prompts) - 1] = i
-
-    # Remove apply_chat_template and use direct prompt
-    prompts = [t["content"] for t in prompts]
+            prompt = get_prompt(trajectory, narrative)
+            prompts.append(prompt)
+            prompt_i_to_data_i[len(prompts) - 1] = i
 
     # Generate responses
     sampling_params = SamplingParams(
@@ -78,21 +73,19 @@ if __name__ == "__main__":
         max_tokens=args.maxlen,
         seed=args.seed
     )
-    response = llm.generate(prompts, sampling_params)
-    output = [x.outputs[0].text for x in response]
+    responses = llm.generate(prompts, sampling_params)
+    outputs = [resp.outputs[0].text for resp in responses]
 
-    # Merge generated questions into trajectory
-    for r in range(len(output)):
-        try:
-            # Extract the generated question after 'Question:'
-            question = output[r].rsplit('Question:', 1)[1].strip()
-            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "user", "content": question})
-        except IndexError:
-            # If 'Question:' is not found, append the entire output
-            print(prompt_i_to_traj_i[r], 'added all outputs')
-            combined_data[prompt_i_to_traj_i[r]]['trajectory'].append({"role": "user", "content": output[r].strip()})
+    # Merge generated messages into trajectory
+    for idx, output in enumerate(outputs):
+        data_idx = prompt_i_to_data_i[idx]
+        # 출력 내용을 바로 추가
+        combined_data[data_idx]['trajectory'].append({"role": "user", "content": output.strip()})
+        print(f"Data index {data_idx}: Added output as user: {output.strip()}")
+
 
     # Save the updated dataset
     with open(args.dataset, 'wb') as handle:
         pickle.dump(combined_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f'Questions generated and saved to {args.dataset}')
+    print(f'Messages generated and saved to {args.dataset}')
+
